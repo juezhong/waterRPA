@@ -1,0 +1,20 @@
+[project]
+name = "waterRPA"
+version = "0.1.0"
+description = "不高兴就喝水 RPA 配置工具 — 基于图像识别的桌面自动化"
+requires-python = ">=3.12"
+dependencies = [
+    "pyautogui>=0.9.54",
+    "pyperclip>=1.11.0",
+    "pyside6>=6.10.0",
+    "opencv-python>=4.13.0",
+    "pynput>=1.8.2",
+    "Pillow>=12.2.0",
+    "pyscreeze>=1.0.0",
+    "mss>=10.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]

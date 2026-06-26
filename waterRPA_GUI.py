@@ -9,45 +9,133 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QPushButton, QLabel, QComboBox, QLineEdit, QScrollArea, 
                                QFileDialog, QTextEdit, QMessageBox, QFrame)
 from PySide6.QtCore import Qt, QThread, Signal
-
+from pynput.keyboard import GlobalHotKeys, Key
 # --------------------------
 # 核心逻辑 (原 waterRPA.py)
 # --------------------------
 
-def mouseClick(clickTimes, lOrR, img, reTry, timeout=60):
+# ---- 多屏截图定位 ----
+# 主屏用 pyautogui（可靠），副屏用 screencapture -D<N> 单独抓图匹配。
+_retina_scale = None
+
+
+def _get_scale():
+    global _retina_scale
+    if _retina_scale is None:
+        import pyscreeze
+        shot = pyscreeze.screenshot(region=None)
+        logical_w, logical_h = pyautogui.size()
+        _retina_scale = shot.size[0] / logical_w if logical_w > 0 else 2.0
+    return _retina_scale
+
+
+def _locate_on_screen_n(img_path, display_id, mon_left, mon_top, confidence=0.9):
+    """在指定显示器上定位图片。display_id=1 是主屏，2 是副屏……"""
+    import subprocess, tempfile, pyscreeze
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        tmp = f.name
+    try:
+        subprocess.run(
+            ["screencapture", "-x", f"-D{display_id}", tmp],
+            capture_output=True, timeout=5,
+        )
+        box = pyscreeze.locate(img_path, tmp, confidence=confidence)
+        if box is not None:
+            cx, cy = pyscreeze.center(box)
+            # screencapture 截的是物理像素，需要转逻辑坐标
+            from PIL import Image as _Img
+            shot = _Img.open(tmp)
+            import mss as _mss
+            with _mss.MSS() as sct:
+                mon = sct.monitors[display_id]
+                scale = shot.size[0] / mon["width"] if mon["width"] > 0 else 1.0
+            logical_cx = round(cx / scale)
+            logical_cy = round(cy / scale)
+            print(f"[匹配] {os.path.basename(img_path)} "
+                  f"屏{display_id}(screencapture) scale={scale:.1f}x "
+                  f"物理({cx},{cy})→逻辑({logical_cx},{logical_cy})"
+                  f"→屏幕({mon_left+logical_cx},{mon_top+logical_cy})")
+            return pyautogui.Point(mon_left + logical_cx, mon_top + logical_cy)
+    except Exception as e:
+        print(f"[匹配] screencapture 屏{display_id} 异常: {e}")
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return None
+
+
+def _locate_on_all_screens(img_path, confidence=0.9):
+    # 主屏：pyautogui（已验证可靠）
+    try:
+        pt = pyautogui.locateCenterOnScreen(img_path, confidence=confidence)
+        if pt is not None:
+            s = _get_scale()
+            cx, cy = round(pt.x / s), round(pt.y / s)
+            print(f"[匹配] {os.path.basename(img_path)} "
+                  f"物理({pt.x},{pt.y})→逻辑({cx},{cy}) scale={s:.1f}x")
+            return pyautogui.Point(cx, cy)
+    except Exception as e:
+        print(f"[匹配] 异常: {e}")
+
+    # 副屏：逐个用 screencapture -D<N> 抓取匹配
+    import mss as _mss
+    with _mss.MSS() as sct:
+        for i in range(2, len(sct.monitors)):
+            mon = sct.monitors[i]
+            result = _locate_on_screen_n(
+                img_path, i, mon["left"], mon["top"], confidence)
+            if result is not None:
+                return result
+
+    return None
+# ------------------------------
+
+def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
     """
     reTry: 1 (一次), -1 (无限), >1 (指定次数)
     timeout: 超时时间(秒)，默认60秒。防止无限卡死。
+    stop_check: 可调用对象，返回 True 时立即中断并返回。
     """
     start_time = time.time()
-    
+
+    def should_stop():
+        return stop_check and stop_check()
+
     if reTry == 1:
         while True:
+            # 检查停止信号
+            if should_stop():
+                print("收到停止信号，中断操作")
+                return
             # 检查超时
             if timeout and (time.time() - start_time > timeout):
                 print(f"等待图片 {img} 超时 ({timeout}秒)")
-                return # 或者抛出异常
-            
+                return
+
             try:
-                location=pyautogui.locateCenterOnScreen(img,confidence=0.9)
+                location=_locate_on_all_screens(img, confidence=0.9)
                 if location is not None:
                     pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.2,duration=0.2,button=lOrR)
                     break
             except pyautogui.ImageNotFoundException:
                 pass # 没找到，继续重试
-            
+
             print("未找到匹配图片,0.1秒后重试")
             time.sleep(0.1)
     elif reTry == -1:
         while True:
-            # 无限重试通常也需要某种中断机制，这里保留原意但增加超时保护（可选）
-            # 如果确实想“死等”，可以把 timeout 设为 None
+            if should_stop():
+                print("收到停止信号，中断操作")
+                return
             if timeout and (time.time() - start_time > timeout):
                 print(f"等待图片 {img} 超时 ({timeout}秒)")
-                return 
+                return
 
             try:
-                location=pyautogui.locateCenterOnScreen(img,confidence=0.9)
+                location=_locate_on_all_screens(img, confidence=0.9)
                 if location is not None:
                     pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.2,duration=0.2,button=lOrR)
             except pyautogui.ImageNotFoundException:
@@ -57,33 +145,40 @@ def mouseClick(clickTimes, lOrR, img, reTry, timeout=60):
     elif reTry > 1:
         i = 1
         while i < reTry + 1:
+            if should_stop():
+                print("收到停止信号，中断操作")
+                return
             if timeout and (time.time() - start_time > timeout):
                 print(f"操作超时 ({timeout}秒)")
                 return
 
             try:
-                location=pyautogui.locateCenterOnScreen(img,confidence=0.9)
+                location=_locate_on_all_screens(img, confidence=0.9)
                 if location is not None:
                     pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.2,duration=0.2,button=lOrR)
                     print("重复")
                     i += 1
             except pyautogui.ImageNotFoundException:
                 pass
-            
+
             time.sleep(0.1)
 
-def mouseMove(img, reTry, timeout=60):
+def mouseMove(img, reTry, timeout=60, stop_check=None):
     """
     鼠标悬停（移动但不点击）
+    stop_check: 可调用对象，返回 True 时立即中断并返回。
     """
     start_time = time.time()
     while True:
+        if stop_check and stop_check():
+            print("收到停止信号，中断操作")
+            return
         if timeout and (time.time() - start_time > timeout):
             print(f"等待图片 {img} 超时 ({timeout}秒)")
             return
 
         try:
-            location = pyautogui.locateCenterOnScreen(img, confidence=0.9)
+            location = _locate_on_all_screens(img, confidence=0.9)
             if location is not None:
                 pyautogui.moveTo(location.x, location.y, duration=0.2)
                 break
@@ -92,8 +187,8 @@ def mouseMove(img, reTry, timeout=60):
 
         print("未找到匹配图片,0.1秒后重试")
         time.sleep(0.1)
-        if reTry == 1: # 如果只试一次且没找到，直接退出（或者遵循原逻辑死循环？原mouseClick逻辑是reTry=1也会死循环直到找到，这里保持一致）
-            pass 
+        if reTry == 1:
+            pass
         # 注意：原mouseClick中 reTry=1 也是 while True，直到找到。这里保持一致。
 
 class RPAEngine:
@@ -131,26 +226,34 @@ class RPAEngine:
                         callback_msg(f"执行步骤 {idx+1}: 类型={cmd_type}, 内容={cmd_value}")
 
                     if cmd_type == 1.0: # 单击左键
-                        mouseClick(1, "left", cmd_value, retry)
+                        mouseClick(1, "left", cmd_value, retry, stop_check=lambda: self.stop_requested)
                         if callback_msg: callback_msg(f"单击左键: {cmd_value}")
-                    
+
                     elif cmd_type == 2.0: # 双击左键
-                        mouseClick(2, "left", cmd_value, retry)
+                        mouseClick(2, "left", cmd_value, retry, stop_check=lambda: self.stop_requested)
                         if callback_msg: callback_msg(f"双击左键: {cmd_value}")
-                    
+
                     elif cmd_type == 3.0: # 右键
-                        mouseClick(1, "right", cmd_value, retry)
+                        mouseClick(1, "right", cmd_value, retry, stop_check=lambda: self.stop_requested)
                         if callback_msg: callback_msg(f"右键单击: {cmd_value}")
-                    
+
                     elif cmd_type == 4.0: # 输入
                         pyperclip.copy(str(cmd_value))
                         pyautogui.hotkey('ctrl', 'v')
                         time.sleep(0.5)
                         if callback_msg: callback_msg(f"输入文本: {cmd_value}")
-                    
-                    elif cmd_type == 5.0: # 等待
+
+                    elif cmd_type == 5.0: # 等待 (可被停止信号中断)
                         sleep_time = float(cmd_value)
-                        time.sleep(sleep_time)
+                        elapsed = 0.0
+                        chunk = 0.1
+                        while elapsed < sleep_time:
+                            if self.stop_requested:
+                                if callback_msg: callback_msg("等待被停止信号中断")
+                                return
+                            wait = min(chunk, sleep_time - elapsed)
+                            time.sleep(wait)
+                            elapsed += wait
                         if callback_msg: callback_msg(f"等待 {sleep_time} 秒")
                     
                     elif cmd_type == 6.0: # 滚轮
@@ -166,7 +269,7 @@ class RPAEngine:
                         if callback_msg: callback_msg(f"按键组合: {cmd_value}")
 
                     elif cmd_type == 8.0: # 鼠标悬停
-                        mouseMove(cmd_value, retry)
+                        mouseMove(cmd_value, retry, stop_check=lambda: self.stop_requested)
                         if callback_msg: callback_msg(f"鼠标悬停: {cmd_value}")
 
                     elif cmd_type == 9.0: # 截图保存
@@ -232,6 +335,31 @@ class WorkerThread(QThread):
 
     def log_callback(self, msg):
         self.log_signal.emit(msg)
+
+class HotkeyThread(QThread):
+    """全局热键监听线程 — F7 开始执行，F8 停止执行"""
+    start_signal = Signal()
+    stop_signal = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self._listener = None
+
+    def run(self):
+        def on_f7():
+            self.start_signal.emit()
+
+        def on_f8():
+            self.stop_signal.emit()
+
+        with GlobalHotKeys({'<f7>': on_f7, '<f8>': on_f8}) as listener:
+            self._listener = listener
+            listener.join()
+
+    def stop_listener(self):
+        if self._listener is not None:
+            self._listener.stop()
+
 
 class TaskRow(QFrame):
     def __init__(self, parent_layout, delete_callback):
@@ -375,6 +503,12 @@ class RPAWindow(QMainWindow):
         self.worker = None
         self.rows = []
 
+        # 全局热键 F7 开始 / F8 停止
+        self.hotkey_thread = HotkeyThread()
+        self.hotkey_thread.start_signal.connect(self.start_task)
+        self.hotkey_thread.stop_signal.connect(self.stop_task)
+        self.hotkey_thread.start()
+
         # 主布局
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -411,7 +545,12 @@ class RPAWindow(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_task)
         self.stop_btn.setEnabled(False)
         top_bar.addWidget(self.stop_btn)
-        
+
+        # 快捷键提示
+        hotkey_hint = QLabel("F7 启动 | F8 停止")
+        hotkey_hint.setStyleSheet("color: #888; font-size: 11px; padding: 2px 8px;")
+        top_bar.addWidget(hotkey_hint)
+
         main_layout.addLayout(top_bar)
 
         # 任务列表区域 (滚动)
@@ -490,9 +629,7 @@ class RPAWindow(QMainWindow):
             # 重新添加行
             for task in tasks:
                 self.add_row(task)
-                
-            QMessageBox.information(self, "成功", f"成功导入 {len(tasks)} 条指令！")
-            
+
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导入失败: {e}")
 
@@ -549,6 +686,10 @@ class RPAWindow(QMainWindow):
             self.engine.stop()
             self.worker.quit()
             self.worker.wait()
+        # 停止全局热键监听
+        self.hotkey_thread.stop_listener()
+        self.hotkey_thread.quit()
+        self.hotkey_thread.wait()
         event.accept()
 
 def main():
