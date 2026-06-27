@@ -13,52 +13,178 @@ from pynput.keyboard import GlobalHotKeys, Key
 import cv2
 import numpy as np
 import mss
+import atexit
+from collections import OrderedDict
 # --------------------------
 # 核心逻辑 (原 waterRPA.py)
 # --------------------------
 
 # ---- 多屏截图定位 ----
-# mss（CoreGraphics 直抓，~30ms）+ OpenCV 模板匹配（~20ms），
-# 比 pyautogui screencapture 子进程（~300ms）快 10 倍。
+# mss（CoreGraphics 直抓）+ OpenCV 灰度匹配，全局单例复用 avoid 重复创建开销。
 # 自动适配 Retina：模板在 1.0x/0.5x 两个尺度尝试匹配。
+
+_mss = mss.MSS()  # 模块级单例，全生命周期复用
+
+# 模板 LRU 缓存 + 位置缓存
+_NEEDLE_CACHE_SIZE = 3
+_recog_cache = {
+    "needles": OrderedDict(),  # img_path -> (gray_full, gray_half), LRU
+    "last_hits": {},           # img_path -> (mon_idx, abs_x, abs_y)
+}
+
+
+_active_monitor_cache = None  # 任务开始时锁定，避免执行期间鼠标跳屏
+
+
+def _reset_recog_cache():
+    """每次 run_tasks 开始时清除位置缓存，重新检测当前屏幕。"""
+    global _active_monitor_cache
+    _recog_cache["last_hits"].clear()
+    _active_monitor_cache = None  # 下次 _get_active_monitor_idx 重新计算
+
+
+def _clear_all_cache():
+    """程序退出时释放所有缓存。"""
+    _recog_cache["needles"].clear()
+    _recog_cache["last_hits"].clear()
+
+
+atexit.register(_clear_all_cache)
+
+
+def _get_needle(img_path):
+    """LRU 缓存模板，预计算 0.5x 降采样版本，上限 3 个。"""
+    if img_path in _recog_cache["needles"]:
+        # 命中：移到末尾（标记最近使用）
+        _recog_cache["needles"].move_to_end(img_path)
+        return _recog_cache["needles"][img_path]
+
+    # 未命中：加载 + 预计算
+    full = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if full is None:
+        return None, None
+    half = cv2.resize(full, None, fx=0.5, fy=0.5) if min(full.shape) > 20 else full
+    pair = (full, half)
+
+    # LRU 淘汰
+    if len(_recog_cache["needles"]) >= _NEEDLE_CACHE_SIZE:
+        _recog_cache["needles"].popitem(last=False)
+
+    _recog_cache["needles"][img_path] = pair
+    return pair
+
+
+def _get_active_monitor_idx():
+    """返回任务启动时所在显示器的 mss 索引（1-based），一次计算后缓存。"""
+    global _active_monitor_cache
+    if _active_monitor_cache is not None:
+        return _active_monitor_cache
+    mx, my = pyautogui.position()
+    for i, mon in enumerate(_mss.monitors[1:], start=1):
+        if mon["left"] <= mx < mon["left"] + mon["width"] and \
+           mon["top"] <= my < mon["top"] + mon["height"]:
+            _active_monitor_cache = i
+            return i
+    _active_monitor_cache = 1
+    return 1
+
+
+def _match_on_haystack(haystack_gray, needle_full, needle_half, confidence):
+    """在给定灰度图上匹配模板。返回 (abs_cx, abs_cy, label) 或 None。
+    abs_cx/cy 是 haystack 内的坐标（不含显示器偏移），label 是日志标签。"""
+    hh, hw = haystack_gray.shape
+    nfh, nfw = needle_full.shape
+
+    # --- 0.5x 降采样（主路径）---
+    nhh, nhw = needle_half.shape
+    if nhh <= hh and nhw <= hw and min(nfh, nfw) > 20:
+        hay_half = cv2.resize(haystack_gray, None, fx=0.5, fy=0.5)
+        result = cv2.matchTemplate(hay_half, needle_half, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if max_val >= confidence:
+            cx = (max_loc[0] + nhw // 2) * 2
+            cy = (max_loc[1] + nhh // 2) * 2
+            return (cx, cy, f"s=0.5 c={max_val:.2f}")
+
+    # --- 1.0x 回退 ---
+    if nfh <= hh and nfw <= hw:
+        result = cv2.matchTemplate(haystack_gray, needle_full, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if max_val >= confidence:
+            cx = max_loc[0] + nfw // 2
+            cy = max_loc[1] + nfh // 2
+            return (cx, cy, f"s=1.0 c={max_val:.2f}")
+
+    return None
+
+
+_REGION_MARGIN = 200
 
 
 def _locate_on_all_screens(img_path, confidence=0.9):
-    """mss 快速截图 + OpenCV 灰度匹配，多屏 + Retina 自适应。"""
-    needle_orig = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    if needle_orig is None:
+    """mss 快速截图 + OpenCV 灰度匹配，带区域缓存和屏幕优先级。"""
+    needle_full, needle_half = _get_needle(img_path)
+    if needle_full is None:
         return None
 
-    with mss.MSS() as sct:
-        for i, mon in enumerate(sct.monitors[1:], start=1):
-            shot = sct.grab(mon)
-            # mss BGRA → 灰度，单通道匹配速度最快
-            bgra = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(
-                (shot.height, shot.width, 4))
-            haystack_gray = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
+    # --- Phase 1: ±200px 区域优先搜索 ---
+    last = _recog_cache["last_hits"].get(img_path)
+    if last is not None:
+        prev_idx, prev_x, prev_y = last
+        if 0 <= prev_idx < len(_mss.monitors):
+            mon = _mss.monitors[prev_idx]
+            l = max(mon["left"], prev_x - _REGION_MARGIN)
+            t = max(mon["top"], prev_y - _REGION_MARGIN)
+            r = min(mon["left"] + mon["width"], prev_x + _REGION_MARGIN)
+            b = min(mon["top"] + mon["height"], prev_y + _REGION_MARGIN)
+            rw, rh = r - l, b - t
 
-            # Retina 模板 2x 物理像素 vs mss 1x 逻辑像素 → 试 0.5x 缩放
-            for scale in (1.0, 0.5):
-                needle = (cv2.resize(needle_orig, None, fx=0.5, fy=0.5)
-                          if scale == 0.5 else needle_orig)
+            if rw > needle_full.shape[1] and rh > needle_full.shape[0]:
+                try:
+                    reg = {"left": l, "top": t, "width": rw, "height": rh}
+                    shot = _mss.grab(reg)
+                    bgra = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(
+                        (shot.height, shot.width, 4))
+                    haystack = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
 
-                if (needle.shape[0] > haystack_gray.shape[0] or
-                        needle.shape[1] > haystack_gray.shape[1]):
-                    continue
+                    found = _match_on_haystack(
+                        haystack, needle_full, needle_half, confidence)
+                    if found is not None:
+                        cx, cy, label = found
+                        abs_x, abs_y = l + cx, t + cy
+                        _recog_cache["last_hits"][img_path] = (prev_idx, abs_x, abs_y)
+                        print(f"[匹配] {os.path.basename(img_path)} "
+                              f"Rgn屏{prev_idx} {label}→({abs_x},{abs_y})")
+                        return pyautogui.Point(abs_x, abs_y)
+                except Exception:
+                    pass
+            # 区域失败 → 清除缓存，走全屏搜索
+            del _recog_cache["last_hits"][img_path]
 
-                result = cv2.matchTemplate(haystack_gray, needle,
-                                           cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+    # --- Phase 2: 全屏搜索（优先跨屏）---
+    active = _get_active_monitor_idx()
+    indices = list(range(1, len(_mss.monitors)))
+    if len(indices) > 1:
+        indices = [i for i in indices if i != active] + [active]
 
-                if max_val >= confidence:
-                    cx = max_loc[0] + needle.shape[1] // 2
-                    cy = max_loc[1] + needle.shape[0] // 2
-                    abs_x = mon["left"] + cx
-                    abs_y = mon["top"] + cy
-                    print(f"[匹配] {os.path.basename(img_path)} "
-                          f"屏{i} s={scale:.1f}→({abs_x},{abs_y}) c={max_val:.2f}")
-                    return pyautogui.Point(abs_x, abs_y)
+    for i in indices:
+        mon = _mss.monitors[i]
+        shot = _mss.grab(mon)
+        bgra = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(
+            (shot.height, shot.width, 4))
+        haystack_gray = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
 
+        found = _match_on_haystack(haystack_gray, needle_full, needle_half, confidence)
+        if found is not None:
+            cx, cy, label = found
+            abs_x, abs_y = mon["left"] + cx, mon["top"] + cy
+            _recog_cache["last_hits"][img_path] = (i, abs_x, abs_y)
+            print(f"[匹配] {os.path.basename(img_path)} "
+                  f"全屏屏{i} {label}→({abs_x},{abs_y})")
+            return pyautogui.Point(abs_x, abs_y)
+
+    # 没找到 → 清除过期缓存
+    _recog_cache["last_hits"].pop(img_path, None)
     return None
 # ------------------------------
 
@@ -182,6 +308,8 @@ class RPAEngine:
         """
         self.is_running = True
         self.stop_requested = False
+        # 重置位置缓存，模板缓存保留
+        _reset_recog_cache()
         # 记录鼠标起始位置，任务结束后恢复
         start_pos = pyautogui.position()
 
