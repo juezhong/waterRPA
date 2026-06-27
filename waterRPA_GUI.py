@@ -12,8 +12,17 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QPushButton, QLabel, QComboBox, QLineEdit, QScrollArea, 
                                QFileDialog, QTextEdit, QMessageBox, QFrame, QDialog)
 from PySide6.QtCore import Qt, QThread, Signal
-from pynput.keyboard import GlobalHotKeys, Key
+# pynput KBListener 在 pyobjc 上有 AXIsProcessTrusted 兼容性 bug，手动打补丁
+try:
+    import HIServices
+    if not hasattr(HIServices, 'AXIsProcessTrusted'):
+        HIServices.AXIsProcessTrusted = lambda: True
+except Exception:
+    pass
+
+from pynput.keyboard import GlobalHotKeys, Key, Listener as KBListener
 from pynput.mouse import Listener as MouseListener, Button as MouseButton
+import threading
 import cv2
 import numpy as np
 import mss
@@ -458,8 +467,7 @@ class RPAEngine:
 
                     elif cmd_type == 7.0: # 系统按键 (组合键)
                         keys = str(cmd_value).lower().split('+')
-                        # 去除空格
-                        keys = [k.strip() for k in keys]
+                        keys = [k.strip().replace("cmd", "command") for k in keys]
                         pyautogui.hotkey(*keys)
                         if callback_msg: callback_msg(f"按键组合: {cmd_value}")
 
@@ -596,24 +604,31 @@ class HotkeyThread(QThread):
     start_signal = Signal()
     stop_signal = Signal()
     record_signal = Signal(str, int, int, int, int, int, int)
+    record_text = Signal(str, str)  # (action, value): ("text","hello"), ("hotkey","ctrl+s")
     recording_toggled = Signal(bool)
 
     def __init__(self):
         super().__init__()
         self._kb_listener = None
+        self._kb_rec_listener = None
         self._ms_listener = None
         self.recording = False
-        self._drag_start = None      # (x, y) 拖移起点
-        self._drag_mid = None        # (x, y) 拖移中间点
-        self._last_click_ts = 0.0    # 上次左键释放时间，双击判定
+        self._drag_start = None
+        self._drag_mid = None
+        self._last_click_ts = 0.0
+        # 键盘录制
+        self._text_buf = []
+        self._text_timer = None
 
     def run(self):
         DBL_THRESH = 0.4   # 双击间隔上限
         DRAG_THRESH = 10   # 拖移判定最小像素
 
         def on_f4():
-            if not self.recording:
-                # 短暂延迟让窗口隐藏+listener就绪
+            if self.recording:
+                _flush_text()
+                self._mod_held.clear()
+            else:
                 time.sleep(0.05)
             self.recording = not self.recording
             self._drag_start = None
@@ -671,6 +686,78 @@ class HotkeyThread(QThread):
                 self._drag_mid = (x, y)
             return True
 
+        # 键盘录制
+        _MOD_NAMES = {Key.ctrl: "ctrl", Key.ctrl_l: "ctrl", Key.ctrl_r: "ctrl",
+                      Key.alt: "alt", Key.alt_l: "alt", Key.alt_r: "alt",
+                      Key.cmd: "cmd", Key.cmd_l: "cmd", Key.cmd_r: "cmd",
+                      Key.shift: "shift", Key.shift_r: "shift"}
+        _NAV_NAMES = {Key.enter: "enter", Key.tab: "tab", Key.esc: "esc",
+                      Key.up: "up", Key.down: "down", Key.left: "left",
+                      Key.right: "right", Key.backspace: "backspace",
+                      Key.delete: "delete", Key.space: "space",
+                      Key.home: "home", Key.end: "end",
+                      Key.page_up: "pageup", Key.page_down: "pagedown"}
+        self._mod_held = set()
+        self._text_buf = []
+        self._text_timer = None
+
+        def _key_name(key):
+            if hasattr(key, 'char') and key.char:
+                return key.char
+            return str(key).replace("Key.", "")
+
+        def _flush_text():
+            if self._text_buf:
+                txt = "".join(self._text_buf)
+                self._text_buf.clear()
+                self.record_text.emit("text", txt)
+            if self._text_timer:
+                self._text_timer.cancel()
+            self._text_timer = None
+
+        def on_kb_press(key):
+            if not self.recording:
+                return True
+            if key in (Key.f4, Key.f5, Key.f7, Key.f8):
+                return True
+
+            if key in _MOD_NAMES:
+                self._mod_held.add(_MOD_NAMES[key])
+                return True
+
+            name = _key_name(key)
+
+            if self._mod_held:
+                # 修饰键组合 → flush 文字 + 记录快捷键
+                _flush_text()
+                parts = sorted(self._mod_held)
+                parts.append(name)
+                self.record_text.emit("hotkey", "+".join(parts))
+            elif key in _NAV_NAMES:
+                _flush_text()
+                self.record_text.emit("hotkey", _NAV_NAMES[key])
+            elif hasattr(key, 'char') and key.char and key.char.isprintable():
+                self._text_buf.append(key.char)
+                if self._text_timer:
+                    self._text_timer.cancel()
+                self._text_timer = threading.Timer(0.5, _flush_text)
+                self._text_timer.daemon = True
+                self._text_timer.start()
+            return True
+
+        def on_kb_release(key):
+            if key in _MOD_NAMES:
+                self._mod_held.discard(_MOD_NAMES[key])
+            return True
+
+        try:
+            kb_rec = KBListener(on_press=on_kb_press, on_release=on_kb_release)
+            self._kb_rec_listener = kb_rec
+            kb_rec.start()
+        except Exception:
+            _logger.warning("键盘录制启动失败，仅录制鼠标操作")
+            self._kb_rec_listener = None
+
         kb = GlobalHotKeys({
             '<f4>': on_f4, '<f5>': on_f5, '<f7>': on_f7, '<f8>': on_f8,
         })
@@ -683,6 +770,8 @@ class HotkeyThread(QThread):
     def stop_listener(self):
         if self._kb_listener is not None:
             self._kb_listener.stop()
+        if self._kb_rec_listener is not None:
+            self._kb_rec_listener.stop()
         if self._ms_listener is not None:
             self._ms_listener.stop()
 
@@ -888,6 +977,7 @@ class RPAWindow(QMainWindow):
         self.hotkey_thread.start_signal.connect(self.start_task)
         self.hotkey_thread.stop_signal.connect(self.stop_task)
         self.hotkey_thread.record_signal.connect(self._on_record)
+        self.hotkey_thread.record_text.connect(self._on_record_text)
         self.hotkey_thread.recording_toggled.connect(self._on_recording_toggled)
         self.hotkey_thread.start()
 
@@ -978,6 +1068,16 @@ class RPAWindow(QMainWindow):
             value = f"{x},{y}"
         self.add_row({"type": cmd_type, "value": value, "retry": 1})
         _logger.info(f"录制 {label} → {value}")
+
+    def _on_record_text(self, action, value):
+        if action == "text":
+            self.add_row({"type": 4.0, "value": value, "retry": 1})
+            _logger.info(f"录制 输入文本 → {value}")
+        elif action == "hotkey":
+            # pynput "cmd" → pyautogui "command"
+            value = value.replace("cmd", "command")
+            self.add_row({"type": 7.0, "value": value, "retry": 1})
+            _logger.info(f"录制 系统按键 → {value}")
 
     def _on_recording_toggled(self, entering):
         if entering:
@@ -1090,7 +1190,11 @@ class RPAWindow(QMainWindow):
             config_dir = os.path.dirname(os.path.abspath(filename))
             for task in tasks:
                 value = task.get("value", "")
-                if value and not os.path.isabs(value) and not _is_coordinate(value):
+                # 只有看起来像文件名的才解析为相对路径
+                looks_like_file = value and not os.path.isabs(value) and \
+                    not _is_coordinate(value) and "->" not in value and \
+                    bool(re.search(r'\.(png|jpg|bmp|jpeg|gif)$', value, re.I))
+                if looks_like_file:
                     task["value"] = os.path.normpath(
                         os.path.join(config_dir, value))
 
