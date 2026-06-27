@@ -5,6 +5,7 @@ import json
 import pyautogui
 import pyperclip
 import traceback
+import shutil
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QLabel, QComboBox, QLineEdit, QScrollArea, 
                                QFileDialog, QTextEdit, QMessageBox, QFrame)
@@ -432,6 +433,8 @@ CMD_TYPES = {
 }
 
 CMD_TYPES_REV = {v: k for k, v in CMD_TYPES.items()}
+_IMAGE_TYPES = {1.0, 2.0, 3.0, 8.0}  # value 字段存图片路径的操作类型
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class WorkerThread(QThread):
     log_signal = Signal(str)
@@ -707,39 +710,85 @@ class RPAWindow(QMainWindow):
         tasks = []
         for row in self.rows:
             data = row.get_data()
-            # 允许保存空值，方便后续编辑
             tasks.append(data)
-            
+
         if not tasks:
             QMessageBox.warning(self, "警告", "没有可保存的配置")
             return
 
-        filename, _ = QFileDialog.getSaveFileName(self, "保存配置", os.getcwd(), "JSON Files (*.json);;Text Files (*.txt)")
-        if filename:
-            try:
-                with open(filename, 'w', encoding='utf-8') as f:
-                    json.dump(tasks, f, indent=4, ensure_ascii=False)
-                QMessageBox.information(self, "成功", "配置已保存！")
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"保存失败: {e}")
+        from PySide6.QtWidgets import QInputDialog
+
+        profiles_dir = os.path.join(_PROJECT_DIR, "profiles")
+        images_dir = os.path.join(profiles_dir, "images")
+        os.makedirs(images_dir, exist_ok=True)
+
+        name, ok = QInputDialog.getText(
+            self, "保存配置", "配置名称（不含扩展名）:")
+        if not ok or not name.strip():
+            return
+        name = "".join(c for c in name.strip() if c not in r'\/:*?"<>|')
+
+        # 迁移图片到 profiles/images/
+        for task in tasks:
+            cmd_type = task.get("type")
+            value = task.get("value", "")
+            if cmd_type not in _IMAGE_TYPES or not value:
+                continue
+            src = os.path.abspath(value)
+            if not os.path.isfile(src):
+                continue
+            # 已在 images/ 目录内 → 跳过
+            if os.path.commonpath([src, os.path.abspath(images_dir)]) == os.path.abspath(images_dir):
+                task["value"] = os.path.join("images", os.path.basename(src))
+                continue
+
+            basename = os.path.basename(src)
+            dest = os.path.join(images_dir, basename)
+            # 重名处理
+            if os.path.exists(dest) and not os.path.samefile(src, dest):
+                stem, ext = os.path.splitext(basename)
+                i = 2
+                while os.path.exists(dest):
+                    dest = os.path.join(images_dir, f"{stem}_{i}{ext}")
+                    i += 1
+
+            shutil.move(src, dest)
+            task["value"] = os.path.join("images", os.path.basename(dest))
+
+        filepath = os.path.join(profiles_dir, f"{name}.json")
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(tasks, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败: {e}")
 
     def load_config(self):
-        filename, _ = QFileDialog.getOpenFileName(self, "导入配置", os.getcwd(), "JSON Files (*.json);;Text Files (*.txt)")
+        profiles_dir = os.path.join(_PROJECT_DIR, "profiles")
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "导入配置", profiles_dir, "JSON Files (*.json)")
         if not filename:
             return
-            
+
         try:
             with open(filename, 'r', encoding='utf-8') as f:
                 tasks = json.load(f)
-            
+
             if not isinstance(tasks, list):
                 raise ValueError("文件格式不正确")
+
+            # 相对路径 → 绝对路径（从 profiles/ 目录解析）
+            config_dir = os.path.dirname(os.path.abspath(filename))
+            for task in tasks:
+                value = task.get("value", "")
+                if value and not os.path.isabs(value):
+                    task["value"] = os.path.normpath(
+                        os.path.join(config_dir, value))
 
             # 清空现有行
             for row in self.rows:
                 row.deleteLater()
             self.rows.clear()
-            
+
             # 重新添加行
             for task in tasks:
                 self.add_row(task)
