@@ -10,88 +10,60 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QFileDialog, QTextEdit, QMessageBox, QFrame)
 from PySide6.QtCore import Qt, QThread, Signal
 from pynput.keyboard import GlobalHotKeys, Key
+import cv2
+import numpy as np
+import mss
 # --------------------------
 # 核心逻辑 (原 waterRPA.py)
 # --------------------------
 
 # ---- 多屏截图定位 ----
-# 主屏用 pyautogui（可靠），副屏用 screencapture -D<N> 单独抓图匹配。
-_retina_scale = None
-
-
-def _get_scale():
-    global _retina_scale
-    if _retina_scale is None:
-        import pyscreeze
-        shot = pyscreeze.screenshot(region=None)
-        logical_w, logical_h = pyautogui.size()
-        _retina_scale = shot.size[0] / logical_w if logical_w > 0 else 2.0
-    return _retina_scale
-
-
-def _locate_on_screen_n(img_path, display_id, mon_left, mon_top, confidence=0.9):
-    """在指定显示器上定位图片。display_id=1 是主屏，2 是副屏……"""
-    import subprocess, tempfile, pyscreeze
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        tmp = f.name
-    try:
-        subprocess.run(
-            ["screencapture", "-x", f"-D{display_id}", tmp],
-            capture_output=True, timeout=5,
-        )
-        box = pyscreeze.locate(img_path, tmp, confidence=confidence)
-        if box is not None:
-            cx, cy = pyscreeze.center(box)
-            # screencapture 截的是物理像素，需要转逻辑坐标
-            from PIL import Image as _Img
-            shot = _Img.open(tmp)
-            import mss as _mss
-            with _mss.MSS() as sct:
-                mon = sct.monitors[display_id]
-                scale = shot.size[0] / mon["width"] if mon["width"] > 0 else 1.0
-            logical_cx = round(cx / scale)
-            logical_cy = round(cy / scale)
-            print(f"[匹配] {os.path.basename(img_path)} "
-                  f"屏{display_id}(screencapture) scale={scale:.1f}x "
-                  f"物理({cx},{cy})→逻辑({logical_cx},{logical_cy})"
-                  f"→屏幕({mon_left+logical_cx},{mon_top+logical_cy})")
-            return pyautogui.Point(mon_left + logical_cx, mon_top + logical_cy)
-    except Exception as e:
-        print(f"[匹配] screencapture 屏{display_id} 异常: {e}")
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-    return None
+# mss（CoreGraphics 直抓，~30ms）+ OpenCV 模板匹配（~20ms），
+# 比 pyautogui screencapture 子进程（~300ms）快 10 倍。
+# 自动适配 Retina：模板在 1.0x/0.5x 两个尺度尝试匹配。
 
 
 def _locate_on_all_screens(img_path, confidence=0.9):
-    # 主屏：pyautogui（已验证可靠）
-    try:
-        pt = pyautogui.locateCenterOnScreen(img_path, confidence=confidence)
-        if pt is not None:
-            s = _get_scale()
-            cx, cy = round(pt.x / s), round(pt.y / s)
-            print(f"[匹配] {os.path.basename(img_path)} "
-                  f"物理({pt.x},{pt.y})→逻辑({cx},{cy}) scale={s:.1f}x")
-            return pyautogui.Point(cx, cy)
-    except Exception as e:
-        print(f"[匹配] 异常: {e}")
+    """mss 快速截图 + OpenCV 灰度匹配，多屏 + Retina 自适应。"""
+    needle_orig = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if needle_orig is None:
+        return None
 
-    # 副屏：逐个用 screencapture -D<N> 抓取匹配
-    import mss as _mss
-    with _mss.MSS() as sct:
-        for i in range(2, len(sct.monitors)):
-            mon = sct.monitors[i]
-            result = _locate_on_screen_n(
-                img_path, i, mon["left"], mon["top"], confidence)
-            if result is not None:
-                return result
+    with mss.MSS() as sct:
+        for i, mon in enumerate(sct.monitors[1:], start=1):
+            shot = sct.grab(mon)
+            # mss BGRA → 灰度，单通道匹配速度最快
+            bgra = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(
+                (shot.height, shot.width, 4))
+            haystack_gray = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
+
+            # Retina 模板 2x 物理像素 vs mss 1x 逻辑像素 → 试 0.5x 缩放
+            for scale in (1.0, 0.5):
+                needle = (cv2.resize(needle_orig, None, fx=0.5, fy=0.5)
+                          if scale == 0.5 else needle_orig)
+
+                if (needle.shape[0] > haystack_gray.shape[0] or
+                        needle.shape[1] > haystack_gray.shape[1]):
+                    continue
+
+                result = cv2.matchTemplate(haystack_gray, needle,
+                                           cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+                if max_val >= confidence:
+                    cx = max_loc[0] + needle.shape[1] // 2
+                    cy = max_loc[1] + needle.shape[0] // 2
+                    abs_x = mon["left"] + cx
+                    abs_y = mon["top"] + cy
+                    print(f"[匹配] {os.path.basename(img_path)} "
+                          f"屏{i} s={scale:.1f}→({abs_x},{abs_y}) c={max_val:.2f}")
+                    return pyautogui.Point(abs_x, abs_y)
 
     return None
 # ------------------------------
+
+SETTLE_DELAY = 0.15  # 动作后沉降时间，等待 UI 动画完成
+
 
 def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
     """
@@ -118,13 +90,13 @@ def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
             try:
                 location=_locate_on_all_screens(img, confidence=0.9)
                 if location is not None:
-                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.2,duration=0.2,button=lOrR)
+                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.02,duration=0.01,button=lOrR)
                     break
             except pyautogui.ImageNotFoundException:
                 pass # 没找到，继续重试
 
-            print("未找到匹配图片,0.1秒后重试")
-            time.sleep(0.1)
+            print("未找到匹配图片,重试中...")
+            time.sleep(0.03)
     elif reTry == -1:
         while True:
             if should_stop():
@@ -137,11 +109,11 @@ def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
             try:
                 location=_locate_on_all_screens(img, confidence=0.9)
                 if location is not None:
-                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.2,duration=0.2,button=lOrR)
+                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.02,duration=0.01,button=lOrR)
             except pyautogui.ImageNotFoundException:
                 pass
 
-            time.sleep(0.1)
+            time.sleep(0.03)
     elif reTry > 1:
         i = 1
         while i < reTry + 1:
@@ -155,13 +127,13 @@ def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
             try:
                 location=_locate_on_all_screens(img, confidence=0.9)
                 if location is not None:
-                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.2,duration=0.2,button=lOrR)
+                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.02,duration=0.01,button=lOrR)
                     print("重复")
                     i += 1
             except pyautogui.ImageNotFoundException:
                 pass
 
-            time.sleep(0.1)
+            time.sleep(0.03)
 
 def mouseMove(img, reTry, timeout=60, stop_check=None):
     """
@@ -180,13 +152,13 @@ def mouseMove(img, reTry, timeout=60, stop_check=None):
         try:
             location = _locate_on_all_screens(img, confidence=0.9)
             if location is not None:
-                pyautogui.moveTo(location.x, location.y, duration=0.2)
+                pyautogui.moveTo(location.x, location.y, duration=0.01)
                 break
         except pyautogui.ImageNotFoundException:
             pass
 
-        print("未找到匹配图片,0.1秒后重试")
-        time.sleep(0.1)
+        print("未找到匹配图片,重试中...")
+        time.sleep(0.03)
         if reTry == 1:
             pass
         # 注意：原mouseClick中 reTry=1 也是 while True，直到找到。这里保持一致。
@@ -210,7 +182,9 @@ class RPAEngine:
         """
         self.is_running = True
         self.stop_requested = False
-        
+        # 记录鼠标起始位置，任务结束后恢复
+        start_pos = pyautogui.position()
+
         try:
             while True:
                 for idx, task in enumerate(tasks):
@@ -240,7 +214,7 @@ class RPAEngine:
                     elif cmd_type == 4.0: # 输入
                         pyperclip.copy(str(cmd_value))
                         pyautogui.hotkey('ctrl', 'v')
-                        time.sleep(0.5)
+                        time.sleep(0.15)
                         if callback_msg: callback_msg(f"输入文本: {cmd_value}")
 
                     elif cmd_type == 5.0: # 等待 (可被停止信号中断)
@@ -287,17 +261,26 @@ class RPAEngine:
                         pyautogui.screenshot(filename)
                         if callback_msg: callback_msg(f"截图已保存: {filename}")
 
+                    # 沉降：等待 UI 动画完成，防止下一帧匹配过早
+                    if not self.stop_requested:
+                        time.sleep(SETTLE_DELAY)
+
                 if not loop_forever:
                     break
-                
+
                 if callback_msg: callback_msg("等待 0.1 秒进入下一轮循环...")
-                time.sleep(0.1)
+                time.sleep(0.03)
                 
         except Exception as e:
             if callback_msg: callback_msg(f"执行出错: {e}")
             traceback.print_exc()
         finally:
             self.is_running = False
+            # 鼠标回到起始位置
+            try:
+                pyautogui.moveTo(start_pos.x, start_pos.y, duration=0.01)
+            except Exception:
+                pass
             if callback_msg: callback_msg("任务结束")
 
 # --------------------------
