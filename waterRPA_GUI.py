@@ -90,24 +90,23 @@ def _get_active_monitor_idx():
 
 
 def _match_on_haystack(haystack_gray, needle_full, needle_half, confidence):
-    """在给定灰度图上匹配模板。返回 (abs_cx, abs_cy, label) 或 None。
-    abs_cx/cy 是 haystack 内的坐标（不含显示器偏移），label 是日志标签。"""
+    """在给定灰度图上匹配模板。返回 (cx, cy, label) 或 None。
+    cx/cy 是 haystack 内的坐标（不含显示器偏移）。"""
     hh, hw = haystack_gray.shape
     nfh, nfw = needle_full.shape
 
-    # --- 0.5x 降采样（主路径）---
+    # --- 0.5x needle 降采样匹配（haystack 保持原分辨率，避免 resize 插值损失精度）---
     nhh, nhw = needle_half.shape
     if nhh <= hh and nhw <= hw and min(nfh, nfw) > 20:
-        hay_half = cv2.resize(haystack_gray, None, fx=0.5, fy=0.5)
-        result = cv2.matchTemplate(hay_half, needle_half, cv2.TM_CCOEFF_NORMED)
+        result = cv2.matchTemplate(haystack_gray, needle_half, cv2.TM_CCOEFF_NORMED)
         min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
         if max_val >= confidence:
-            cx = (max_loc[0] + nhw // 2) * 2
-            cy = (max_loc[1] + nhh // 2) * 2
+            cx = max_loc[0] + nhw // 2
+            cy = max_loc[1] + nhh // 2
             return (cx, cy, f"s=0.5 c=+{max_val:.2f}")
         if min_val <= -confidence:
-            cx = (min_loc[0] + nhw // 2) * 2
-            cy = (min_loc[1] + nhh // 2) * 2
+            cx = min_loc[0] + nhw // 2
+            cy = min_loc[1] + nhh // 2
             return (cx, cy, f"s=0.5 c={min_val:.2f}(inv)")
 
     # --- 1.0x 回退 ---
@@ -130,7 +129,7 @@ _REGION_MARGIN = 200
 
 
 def _locate_on_all_screens(img_path, confidence=0.9):
-    """mss 快速截图 + OpenCV 灰度匹配，带区域缓存和屏幕优先级。"""
+    """mss 截图 + OpenCV 匹配，带区域缓存、屏幕优先级、主题反转适配。"""
     needle_full, needle_half = _get_needle(img_path)
     if needle_full is None:
         return None
@@ -154,7 +153,6 @@ def _locate_on_all_screens(img_path, confidence=0.9):
                     bgra = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(
                         (shot.height, shot.width, 4))
                     haystack = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
-
                     found = _match_on_haystack(
                         haystack, needle_full, needle_half, confidence)
                     if found is not None:
@@ -166,7 +164,6 @@ def _locate_on_all_screens(img_path, confidence=0.9):
                         return pyautogui.Point(abs_x, abs_y)
                 except Exception:
                     pass
-            # 区域失败 → 清除缓存，走全屏搜索
             del _recog_cache["last_hits"][img_path]
 
     # --- Phase 2: 全屏搜索（优先跨屏）---
@@ -181,7 +178,6 @@ def _locate_on_all_screens(img_path, confidence=0.9):
         bgra = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(
             (shot.height, shot.width, 4))
         haystack_gray = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
-
         found = _match_on_haystack(haystack_gray, needle_full, needle_half, confidence)
         if found is not None:
             cx, cy, label = found
@@ -191,7 +187,6 @@ def _locate_on_all_screens(img_path, confidence=0.9):
                   f"全屏屏{i} {label}→({abs_x},{abs_y})")
             return pyautogui.Point(abs_x, abs_y)
 
-    # 没找到 → 清除过期缓存
     _recog_cache["last_hits"].pop(img_path, None)
     return None
 # ------------------------------
