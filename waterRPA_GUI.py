@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QFileDialog, QTextEdit, QMessageBox, QFrame)
 from PySide6.QtCore import Qt, QThread, Signal
 from pynput.keyboard import GlobalHotKeys, Key
+from pynput.mouse import Listener as MouseListener, Button as MouseButton
 import cv2
 import numpy as np
 import mss
@@ -192,7 +193,7 @@ def _locate_on_all_screens(img_path, confidence=0.9):
     return None
 # ------------------------------
 
-SETTLE_DELAY = 0.15  # 动作后沉降时间，等待 UI 动画完成
+SETTLE_DELAY = 0.35  # 动作后沉降时间，等待 UI 动画完成
 
 
 def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
@@ -201,6 +202,13 @@ def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
     timeout: 超时时间(秒)，默认60秒。防止无限卡死。
     stop_check: 可调用对象，返回 True 时立即中断并返回。
     """
+    # 坐标直达
+    if _is_coordinate(img):
+        x, y = _parse_coordinate(img)
+        pyautogui.click(x, y, clicks=clickTimes, interval=0.15,
+                        duration=0.25, button=lOrR)
+        return
+
     start_time = time.time()
 
     def should_stop():
@@ -220,7 +228,7 @@ def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
             try:
                 location=_locate_on_all_screens(img, confidence=0.9)
                 if location is not None:
-                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.02,duration=0.01,button=lOrR)
+                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.15,duration=0.25,button=lOrR)
                     break
             except pyautogui.ImageNotFoundException:
                 pass # 没找到，继续重试
@@ -239,7 +247,7 @@ def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
             try:
                 location=_locate_on_all_screens(img, confidence=0.9)
                 if location is not None:
-                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.02,duration=0.01,button=lOrR)
+                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.15,duration=0.25,button=lOrR)
             except pyautogui.ImageNotFoundException:
                 pass
 
@@ -257,7 +265,7 @@ def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
             try:
                 location=_locate_on_all_screens(img, confidence=0.9)
                 if location is not None:
-                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.02,duration=0.01,button=lOrR)
+                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.15,duration=0.25,button=lOrR)
                     print("重复")
                     i += 1
             except pyautogui.ImageNotFoundException:
@@ -270,6 +278,12 @@ def mouseMove(img, reTry, timeout=60, stop_check=None):
     鼠标悬停（移动但不点击）
     stop_check: 可调用对象，返回 True 时立即中断并返回。
     """
+    # 坐标直达
+    if _is_coordinate(img):
+        x, y = _parse_coordinate(img)
+        pyautogui.moveTo(x, y, duration=0.25)
+        return
+
     start_time = time.time()
     while True:
         if stop_check and stop_check():
@@ -282,7 +296,7 @@ def mouseMove(img, reTry, timeout=60, stop_check=None):
         try:
             location = _locate_on_all_screens(img, confidence=0.9)
             if location is not None:
-                pyautogui.moveTo(location.x, location.y, duration=0.01)
+                pyautogui.moveTo(location.x, location.y, duration=0.25)
                 break
         except pyautogui.ImageNotFoundException:
             pass
@@ -301,6 +315,22 @@ class RPAEngine:
     def stop(self):
         self.stop_requested = True
         self.is_running = False
+
+    def _execute_drag(self, value, callback_msg=None):
+        """执行拖移：value 格式 "sx,sy -> mx,my -> ex,ey"。"""
+        parts = [p.strip() for p in value.split("->")]
+        if len(parts) < 2:
+            return
+        points = [_parse_coordinate(p) for p in parts]
+        sx, sy = points[0]
+        pyautogui.moveTo(sx, sy, duration=0.2)
+        pyautogui.mouseDown(button="left")
+        for px, py in points[1:]:
+            if self.stop_requested:
+                pyautogui.mouseUp(button="left")
+                return
+            pyautogui.moveTo(px, py, duration=0.15)
+        pyautogui.mouseUp(button="left")
 
     def run_tasks(self, tasks, loop_forever=False, callback_msg=None):
         """
@@ -342,6 +372,14 @@ class RPAEngine:
                     elif cmd_type == 3.0: # 右键
                         mouseClick(1, "right", cmd_value, retry, stop_check=lambda: self.stop_requested)
                         if callback_msg: callback_msg(f"右键单击: {cmd_value}")
+
+                    elif cmd_type == 10.0: # 中键
+                        mouseClick(1, "middle", cmd_value, retry, stop_check=lambda: self.stop_requested)
+                        if callback_msg: callback_msg(f"中键单击: {cmd_value}")
+
+                    elif cmd_type == 11.0: # 左键拖移
+                        self._execute_drag(cmd_value, callback_msg)
+                        if callback_msg: callback_msg(f"左键拖移: {cmd_value}")
 
                     elif cmd_type == 4.0: # 输入
                         pyperclip.copy(str(cmd_value))
@@ -410,7 +448,7 @@ class RPAEngine:
             self.is_running = False
             # 鼠标回到起始位置
             try:
-                pyautogui.moveTo(start_pos.x, start_pos.y, duration=0.01)
+                pyautogui.moveTo(start_pos.x, start_pos.y, duration=0.25)
             except Exception:
                 pass
             if callback_msg: callback_msg("任务结束")
@@ -429,12 +467,29 @@ CMD_TYPES = {
     "滚轮滑动": 6.0,
     "系统按键": 7.0,
     "鼠标悬停": 8.0,
-    "截图保存": 9.0
+    "截图保存": 9.0,
+    "中键单击": 10.0,
+    "左键拖移": 11.0,
 }
 
 CMD_TYPES_REV = {v: k for k, v in CMD_TYPES.items()}
-_IMAGE_TYPES = {1.0, 2.0, 3.0, 8.0}  # value 字段存图片路径的操作类型
+_IMAGE_TYPES = {1.0, 2.0, 3.0, 8.0, 10.0}  # value 字段可存图片路径的操作类型
+_CLICK_TYPES = {1.0, 2.0, 3.0, 10.0}  # 点击类操作（可走坐标直达）
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+import re
+
+
+def _is_coordinate(value):
+    """检测 value 是否为坐标格式 "x,y"。"""
+    return isinstance(value, str) and bool(
+        re.match(r'^\s*\d+\s*,\s*\d+\s*$', value))
+
+
+def _parse_coordinate(value):
+    """解析坐标字符串为 (x, y) 整数元组。"""
+    x, y = value.split(",")
+    return int(x.strip()), int(y.strip())
 
 class WorkerThread(QThread):
     log_signal = Signal(str)
@@ -454,28 +509,99 @@ class WorkerThread(QThread):
         self.log_signal.emit(msg)
 
 class HotkeyThread(QThread):
-    """全局热键监听线程 — F7 开始执行，F8 停止执行"""
+    """全局热键 + 鼠标监听 — F7/F8 控制执行，F4 录制，F5 悬停"""
     start_signal = Signal()
     stop_signal = Signal()
+    record_signal = Signal(str, int, int, int, int, int, int)
+    recording_toggled = Signal(bool)
 
     def __init__(self):
         super().__init__()
-        self._listener = None
+        self._kb_listener = None
+        self._ms_listener = None
+        self.recording = False
+        self._drag_start = None      # (x, y) 拖移起点
+        self._drag_mid = None        # (x, y) 拖移中间点
+        self._last_click_ts = 0.0    # 上次左键释放时间，双击判定
 
     def run(self):
+        DBL_THRESH = 0.4   # 双击间隔上限
+        DRAG_THRESH = 10   # 拖移判定最小像素
+
+        def on_f4():
+            if not self.recording:
+                # 短暂延迟让窗口隐藏+listener就绪
+                time.sleep(0.05)
+            self.recording = not self.recording
+            self._drag_start = None
+            self._last_click_ts = 0.0
+            self.recording_toggled.emit(self.recording)
+
+        def on_f5():
+            if self.recording:
+                x, y = pyautogui.position()
+                self.record_signal.emit("hover", x, y, 0, 0, 0, 0)
+
         def on_f7():
-            self.start_signal.emit()
+            if not self.recording:
+                self.start_signal.emit()
 
         def on_f8():
-            self.stop_signal.emit()
+            if not self.recording:
+                self.stop_signal.emit()
 
-        with GlobalHotKeys({'<f7>': on_f7, '<f8>': on_f8}) as listener:
-            self._listener = listener
-            listener.join()
+        def on_mouse_click(x, y, button, pressed):
+            if not self.recording:
+                return True
+
+            if button == MouseButton.left:
+                if pressed:
+                    self._drag_start = (x, y)
+                    self._drag_mid = (x, y)
+                else:
+                    sx, sy = self._drag_start or (x, y)
+                    dist = ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5
+                    if dist > DRAG_THRESH:
+                        mx, my = self._drag_mid or ((sx + x) // 2, (sy + y) // 2)
+                        self.record_signal.emit("drag", sx, sy, mx, my, x, y)
+                    else:
+                        # 单击 / 双击判定
+                        now = time.time()
+                        if self._last_click_ts and now - self._last_click_ts < DBL_THRESH:
+                            self.record_signal.emit("dblclick", x, y, 0, 0, 0, 0)
+                            self._last_click_ts = 0.0
+                        else:
+                            self.record_signal.emit("click", x, y, 0, 0, 0, 0)
+                            self._last_click_ts = now
+                    self._drag_start = None
+
+            elif button == MouseButton.right:
+                if pressed:
+                    self.record_signal.emit("right", x, y, 0, 0, 0, 0)
+            elif button == MouseButton.middle:
+                if pressed:
+                    self.record_signal.emit("middle", x, y, 0, 0, 0, 0)
+            return True
+
+        def on_mouse_move(x, y):
+            if self.recording and self._drag_start:
+                self._drag_mid = (x, y)
+            return True
+
+        kb = GlobalHotKeys({
+            '<f4>': on_f4, '<f5>': on_f5, '<f7>': on_f7, '<f8>': on_f8,
+        })
+        ms = MouseListener(on_click=on_mouse_click, on_move=on_mouse_move)
+        self._kb_listener = kb
+        self._ms_listener = ms
+        ms.start()
+        kb.run()
 
     def stop_listener(self):
-        if self._listener is not None:
-            self._listener.stop()
+        if self._kb_listener is not None:
+            self._kb_listener.stop()
+        if self._ms_listener is not None:
+            self._ms_listener.stop()
 
 
 class TaskRow(QFrame):
@@ -522,12 +648,12 @@ class TaskRow(QFrame):
     def on_type_changed(self, text):
         cmd_type = CMD_TYPES[text]
         
-        # 图片相关操作 (1, 2, 3, 8)
-        if cmd_type in [1.0, 2.0, 3.0, 8.0]:
+        # 图片相关操作 (1, 2, 3, 8, 10)
+        if cmd_type in [1.0, 2.0, 3.0, 8.0, 10.0]:
             self.file_btn.setVisible(True)
             self.file_btn.setText("选择图片")
             self.retry_input.setVisible(True)
-            self.value_input.setPlaceholderText("图片路径")
+            self.value_input.setPlaceholderText("图片路径或坐标 (如 500,300)")
         # 输入 (4)
         elif cmd_type == 4.0:
             self.file_btn.setVisible(False)
@@ -548,6 +674,11 @@ class TaskRow(QFrame):
             self.file_btn.setVisible(False)
             self.retry_input.setVisible(False)
             self.value_input.setPlaceholderText("组合键 (如 ctrl+s, alt+tab)")
+        # 左键拖移 (11) — 仅坐标
+        elif cmd_type == 11.0:
+            self.file_btn.setVisible(False)
+            self.retry_input.setVisible(False)
+            self.value_input.setPlaceholderText("拖移坐标 (如 100,200 -> 300,400)")
         # 截图保存 (9)
         elif cmd_type == 9.0:
             self.file_btn.setVisible(True)
@@ -620,10 +751,17 @@ class RPAWindow(QMainWindow):
         self.worker = None
         self.rows = []
 
-        # 全局热键 F7 开始 / F8 停止
+        # 全局热键
+        self._rec_action_map = {
+            "click": (1.0, "左键单击"), "dblclick": (2.0, "左键双击"),
+            "right": (3.0, "右键单击"), "middle": (10.0, "中键单击"),
+            "hover": (8.0, "鼠标悬停"), "drag": (11.0, "左键拖移"),
+        }
         self.hotkey_thread = HotkeyThread()
         self.hotkey_thread.start_signal.connect(self.start_task)
         self.hotkey_thread.stop_signal.connect(self.stop_task)
+        self.hotkey_thread.record_signal.connect(self._on_record)
+        self.hotkey_thread.recording_toggled.connect(self._on_recording_toggled)
         self.hotkey_thread.start()
 
         # 主布局
@@ -645,7 +783,11 @@ class RPAWindow(QMainWindow):
         self.load_btn = QPushButton("导入配置")
         self.load_btn.clicked.connect(self.load_config)
         top_bar.addWidget(self.load_btn)
-        
+
+        self.clear_btn = QPushButton("清空指令")
+        self.clear_btn.clicked.connect(self.clear_rows)
+        top_bar.addWidget(self.clear_btn)
+
         top_bar.addStretch()
         
         self.loop_check = QComboBox()
@@ -664,9 +806,9 @@ class RPAWindow(QMainWindow):
         top_bar.addWidget(self.stop_btn)
 
         # 快捷键提示
-        hotkey_hint = QLabel("F7 启动 | F8 停止")
-        hotkey_hint.setStyleSheet("color: #888; font-size: 11px; padding: 2px 8px;")
-        top_bar.addWidget(hotkey_hint)
+        self.hotkey_hint = QLabel("F4录制 | F7启动 | F8停止")
+        self.hotkey_hint.setStyleSheet("color: #888; font-size: 11px; padding: 2px 8px;")
+        top_bar.addWidget(self.hotkey_hint)
 
         main_layout.addLayout(top_bar)
 
@@ -689,6 +831,37 @@ class RPAWindow(QMainWindow):
         # 初始添加一行
         self.add_row()
 
+    def _on_record(self, action, x, y, x2, y2, x3, y3):
+        """录制回调：插入步骤。drag 有 3 个坐标点，其余 1 个。"""
+        if action not in self._rec_action_map:
+            return
+        cmd_type, label = self._rec_action_map[action]
+        if action == "drag":
+            value = f"{x},{y} -> {x2},{y2} -> {x3},{y3}"
+        else:
+            value = f"{x},{y}"
+        self.add_row({"type": cmd_type, "value": value, "retry": 1})
+        print(f"[录制] {label} → {value}")
+
+    def _on_recording_toggled(self, entering):
+        if entering:
+            # 清除初始空行，避免回放时报"有空参数"
+            empty = [r for r in self.rows
+                     if not r.get_data().get("value", "").strip()]
+            for r in empty:
+                self.rows.remove(r)
+                r.deleteLater()
+            self.hotkey_hint.setText("● 录制 F4退出|F5悬停|鼠标操作自动记录")
+            self.hotkey_hint.setStyleSheet(
+                "color: #f44336; font-size: 11px; padding: 2px 8px;")
+            self.hide()
+        else:
+            self.hotkey_hint.setText("F4录制 | F7启动 | F8停止")
+            self.hotkey_hint.setStyleSheet(
+                "color: #888; font-size: 11px; padding: 2px 8px;")
+            self.show()
+            self.activateWindow()
+
     def add_row(self, data=None):
         # 移除底部的弹簧
         self.task_layout.takeAt(self.task_layout.count() - 1)
@@ -705,6 +878,12 @@ class RPAWindow(QMainWindow):
         if row_widget in self.rows:
             self.rows.remove(row_widget)
             row_widget.deleteLater()
+
+    def clear_rows(self):
+        for row in self.rows:
+            row.deleteLater()
+        self.rows.clear()
+        self.add_row()
             
     def save_config(self):
         tasks = []
@@ -728,11 +907,11 @@ class RPAWindow(QMainWindow):
             return
         name = "".join(c for c in name.strip() if c not in r'\/:*?"<>|')
 
-        # 迁移图片到 profiles/images/
+        # 迁移图片到 profiles/images/（坐标格式跳过）
         for task in tasks:
             cmd_type = task.get("type")
             value = task.get("value", "")
-            if cmd_type not in _IMAGE_TYPES or not value:
+            if cmd_type not in _IMAGE_TYPES or not value or _is_coordinate(value):
                 continue
             src = os.path.abspath(value)
             if not os.path.isfile(src):
@@ -776,11 +955,11 @@ class RPAWindow(QMainWindow):
             if not isinstance(tasks, list):
                 raise ValueError("文件格式不正确")
 
-            # 相对路径 → 绝对路径（从 profiles/ 目录解析）
+            # 相对路径 → 绝对路径（坐标格式跳过，从 profiles/ 目录解析）
             config_dir = os.path.dirname(os.path.abspath(filename))
             for task in tasks:
                 value = task.get("value", "")
-                if value and not os.path.isabs(value):
+                if value and not os.path.isabs(value) and not _is_coordinate(value):
                     task["value"] = os.path.normpath(
                         os.path.join(config_dir, value))
 
