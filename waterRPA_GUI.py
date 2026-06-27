@@ -6,9 +6,11 @@ import pyautogui
 import pyperclip
 import traceback
 import shutil
+import logging
+from datetime import datetime
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QLabel, QComboBox, QLineEdit, QScrollArea, 
-                               QFileDialog, QTextEdit, QMessageBox, QFrame)
+                               QFileDialog, QTextEdit, QMessageBox, QFrame, QDialog)
 from PySide6.QtCore import Qt, QThread, Signal
 from pynput.keyboard import GlobalHotKeys, Key
 from pynput.mouse import Listener as MouseListener, Button as MouseButton
@@ -17,6 +19,29 @@ import numpy as np
 import mss
 import atexit
 from collections import OrderedDict
+# ---- 日志 ----
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_log_date = datetime.now().strftime("%Y-%m-%d")
+_log_file = os.path.join(_LOG_DIR, f"{_log_date}.log")
+
+_logger = logging.getLogger("waterRPA")
+_logger.setLevel(logging.DEBUG)
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                         datefmt="%H:%M:%S")
+# 终端输出
+_sh = logging.StreamHandler()
+_sh.setLevel(logging.INFO)
+_sh.setFormatter(_fmt)
+_logger.addHandler(_sh)
+# 文件输出
+_fh = logging.FileHandler(_log_file, encoding="utf-8")
+_fh.setLevel(logging.DEBUG)
+_fh.setFormatter(_fmt)
+_logger.addHandler(_fh)
+# ------------------------------
+
+
 # --------------------------
 # 核心逻辑 (原 waterRPA.py)
 # --------------------------
@@ -161,8 +186,8 @@ def _locate_on_all_screens(img_path, confidence=0.9):
                         cx, cy, label = found
                         abs_x, abs_y = l + cx, t + cy
                         _recog_cache["last_hits"][img_path] = (prev_idx, abs_x, abs_y)
-                        print(f"[匹配] {os.path.basename(img_path)} "
-                              f"Rgn屏{prev_idx} {label}→({abs_x},{abs_y})")
+                        _logger.info(f"匹配 {os.path.basename(img_path)} "
+                                    f"Rgn屏{prev_idx} {label}→({abs_x},{abs_y})")
                         return pyautogui.Point(abs_x, abs_y)
                 except Exception:
                     pass
@@ -185,8 +210,8 @@ def _locate_on_all_screens(img_path, confidence=0.9):
             cx, cy, label = found
             abs_x, abs_y = mon["left"] + cx, mon["top"] + cy
             _recog_cache["last_hits"][img_path] = (i, abs_x, abs_y)
-            print(f"[匹配] {os.path.basename(img_path)} "
-                  f"全屏屏{i} {label}→({abs_x},{abs_y})")
+            _logger.info(f"匹配 {os.path.basename(img_path)} "
+                        f"全屏屏{i} {label}→({abs_x},{abs_y})")
             return pyautogui.Point(abs_x, abs_y)
 
     _recog_cache["last_hits"].pop(img_path, None)
@@ -218,11 +243,11 @@ def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
         while True:
             # 检查停止信号
             if should_stop():
-                print("收到停止信号，中断操作")
+                _logger.info("收到停止信号，中断操作")
                 return
             # 检查超时
             if timeout and (time.time() - start_time > timeout):
-                print(f"等待图片 {img} 超时 ({timeout}秒)")
+                _logger.info(f"等待图片超时: {img}")
                 return
 
             try:
@@ -233,15 +258,15 @@ def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
             except pyautogui.ImageNotFoundException:
                 pass # 没找到，继续重试
 
-            print("未找到匹配图片,重试中...")
+            _logger.debug("未找到匹配")
             time.sleep(0.03)
     elif reTry == -1:
         while True:
             if should_stop():
-                print("收到停止信号，中断操作")
+                _logger.info("收到停止信号，中断操作")
                 return
             if timeout and (time.time() - start_time > timeout):
-                print(f"等待图片 {img} 超时 ({timeout}秒)")
+                _logger.info(f"等待图片超时: {img}")
                 return
 
             try:
@@ -256,17 +281,17 @@ def mouseClick(clickTimes, lOrR, img, reTry, timeout=60, stop_check=None):
         i = 1
         while i < reTry + 1:
             if should_stop():
-                print("收到停止信号，中断操作")
+                _logger.info("收到停止信号，中断操作")
                 return
             if timeout and (time.time() - start_time > timeout):
-                print(f"操作超时 ({timeout}秒)")
+                _logger.info(f"操作超时 ({timeout}s)")
                 return
 
             try:
                 location=_locate_on_all_screens(img, confidence=0.9)
                 if location is not None:
                     pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.15,duration=0.25,button=lOrR)
-                    print("重复")
+                    _logger.debug("重复点击")
                     i += 1
             except pyautogui.ImageNotFoundException:
                 pass
@@ -287,10 +312,10 @@ def mouseMove(img, reTry, timeout=60, stop_check=None):
     start_time = time.time()
     while True:
         if stop_check and stop_check():
-            print("收到停止信号，中断操作")
+            _logger.info("收到停止信号，中断操作")
             return
         if timeout and (time.time() - start_time > timeout):
-            print(f"等待图片 {img} 超时 ({timeout}秒)")
+            _logger.info(f"等待图片超时: {img}")
             return
 
         try:
@@ -301,7 +326,7 @@ def mouseMove(img, reTry, timeout=60, stop_check=None):
         except pyautogui.ImageNotFoundException:
             pass
 
-        print("未找到匹配图片,重试中...")
+        _logger.debug("未找到匹配")
         time.sleep(0.03)
         if reTry == 1:
             pass
@@ -361,25 +386,51 @@ class RPAEngine:
                     if callback_msg:
                         callback_msg(f"执行步骤 {idx+1}: 类型={cmd_type}, 内容={cmd_value}")
 
-                    if cmd_type == 1.0: # 单击左键
-                        mouseClick(1, "left", cmd_value, retry, stop_check=lambda: self.stop_requested)
-                        if callback_msg: callback_msg(f"单击左键: {cmd_value}")
-
-                    elif cmd_type == 2.0: # 双击左键
-                        mouseClick(2, "left", cmd_value, retry, stop_check=lambda: self.stop_requested)
-                        if callback_msg: callback_msg(f"双击左键: {cmd_value}")
-
-                    elif cmd_type == 3.0: # 右键
-                        mouseClick(1, "right", cmd_value, retry, stop_check=lambda: self.stop_requested)
-                        if callback_msg: callback_msg(f"右键单击: {cmd_value}")
-
-                    elif cmd_type == 10.0: # 中键
-                        mouseClick(1, "middle", cmd_value, retry, stop_check=lambda: self.stop_requested)
-                        if callback_msg: callback_msg(f"中键单击: {cmd_value}")
-
-                    elif cmd_type == 11.0: # 左键拖移
+                    # ── 坐标直接操作 (12-16, 11) ──
+                    if cmd_type == 12.0:  # 坐标左键单击
+                        x, y = _parse_coordinate(cmd_value)
+                        pyautogui.click(x, y, clicks=1, interval=0.15,
+                                        duration=0.25, button="left")
+                        if callback_msg: callback_msg(f"坐标单击: {cmd_value}")
+                    elif cmd_type == 13.0:  # 坐标左键双击
+                        x, y = _parse_coordinate(cmd_value)
+                        pyautogui.click(x, y, clicks=2, interval=0.15,
+                                        duration=0.25, button="left")
+                        if callback_msg: callback_msg(f"坐标双击: {cmd_value}")
+                    elif cmd_type == 14.0:  # 坐标右键单击
+                        x, y = _parse_coordinate(cmd_value)
+                        pyautogui.click(x, y, clicks=1, interval=0.15,
+                                        duration=0.25, button="right")
+                        if callback_msg: callback_msg(f"坐标右键: {cmd_value}")
+                    elif cmd_type == 15.0:  # 坐标中键单击
+                        x, y = _parse_coordinate(cmd_value)
+                        pyautogui.click(x, y, clicks=1, interval=0.15,
+                                        duration=0.25, button="middle")
+                        if callback_msg: callback_msg(f"坐标中键: {cmd_value}")
+                    elif cmd_type == 16.0:  # 坐标鼠标悬停
+                        x, y = _parse_coordinate(cmd_value)
+                        pyautogui.moveTo(x, y, duration=0.25)
+                        if callback_msg: callback_msg(f"坐标悬停: {cmd_value}")
+                    elif cmd_type == 11.0:  # 坐标左键拖移
                         self._execute_drag(cmd_value, callback_msg)
-                        if callback_msg: callback_msg(f"左键拖移: {cmd_value}")
+                        if callback_msg: callback_msg(f"拖移: {cmd_value}")
+
+                    # ── 图片识别操作 (1,2,3,10,8) ──
+                    elif cmd_type == 1.0:
+                        mouseClick(1, "left", cmd_value, retry, stop_check=lambda: self.stop_requested)
+                        if callback_msg: callback_msg(f"图片单击: {cmd_value}")
+                    elif cmd_type == 2.0:
+                        mouseClick(2, "left", cmd_value, retry, stop_check=lambda: self.stop_requested)
+                        if callback_msg: callback_msg(f"图片双击: {cmd_value}")
+                    elif cmd_type == 3.0:
+                        mouseClick(1, "right", cmd_value, retry, stop_check=lambda: self.stop_requested)
+                        if callback_msg: callback_msg(f"图片右键: {cmd_value}")
+                    elif cmd_type == 10.0:
+                        mouseClick(1, "middle", cmd_value, retry, stop_check=lambda: self.stop_requested)
+                        if callback_msg: callback_msg(f"图片中键: {cmd_value}")
+                    elif cmd_type == 8.0:
+                        mouseMove(cmd_value, retry, stop_check=lambda: self.stop_requested)
+                        if callback_msg: callback_msg(f"图片悬停: {cmd_value}")
 
                     elif cmd_type == 4.0: # 输入
                         pyperclip.copy(str(cmd_value))
@@ -411,10 +462,6 @@ class RPAEngine:
                         keys = [k.strip() for k in keys]
                         pyautogui.hotkey(*keys)
                         if callback_msg: callback_msg(f"按键组合: {cmd_value}")
-
-                    elif cmd_type == 8.0: # 鼠标悬停
-                        mouseMove(cmd_value, retry, stop_check=lambda: self.stop_requested)
-                        if callback_msg: callback_msg(f"鼠标悬停: {cmd_value}")
 
                     elif cmd_type == 9.0: # 截图保存
                         path = str(cmd_value)
@@ -459,22 +506,36 @@ class RPAEngine:
 
 # 定义操作类型映射
 CMD_TYPES = {
-    "左键单击": 1.0,
-    "左键双击": 2.0,
-    "右键单击": 3.0,
+    # ── 鼠标坐标操作 ──
+    "坐标左键单击": 12.0,
+    "坐标左键双击": 13.0,
+    "坐标右键单击": 14.0,
+    "坐标中键单击": 15.0,
+    "坐标鼠标悬停": 16.0,
+    "坐标左键拖移": 11.0,
+    # ── 图片识别操作 ──
+    "图片左键单击": 1.0,
+    "图片左键双击": 2.0,
+    "图片右键单击": 3.0,
+    "图片中键单击": 10.0,
+    "图片鼠标悬停": 8.0,
+    # ── 其他 ──
     "输入文本": 4.0,
     "等待(秒)": 5.0,
     "滚轮滑动": 6.0,
     "系统按键": 7.0,
-    "鼠标悬停": 8.0,
     "截图保存": 9.0,
-    "中键单击": 10.0,
-    "左键拖移": 11.0,
 }
 
 CMD_TYPES_REV = {v: k for k, v in CMD_TYPES.items()}
-_IMAGE_TYPES = {1.0, 2.0, 3.0, 8.0, 10.0}  # value 字段可存图片路径的操作类型
-_CLICK_TYPES = {1.0, 2.0, 3.0, 10.0}  # 点击类操作（可走坐标直达）
+
+# 图片类操作：value 存图片路径，save_config 时迁移
+_IMG_TYPES = {1.0, 2.0, 3.0, 8.0, 10.0}
+# 坐标类操作：value 存坐标字符串，无需图像识别
+_COORD_TYPES = {11.0, 12.0, 13.0, 14.0, 15.0, 16.0}
+# 点击类：坐标 + 图片都有
+_CLICK_TYPES = {1.0, 2.0, 3.0, 10.0, 12.0, 13.0, 14.0, 15.0}
+
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 import re
@@ -490,6 +551,28 @@ def _parse_coordinate(value):
     """解析坐标字符串为 (x, y) 整数元组。"""
     x, y = value.split(",")
     return int(x.strip()), int(y.strip())
+
+
+# 每类操作的参数名提示
+_TYPE_PARAM_LABEL = {
+    1.0: "图片路径", 2.0: "图片路径", 3.0: "图片路径",
+    8.0: "图片路径", 10.0: "图片路径",
+    11.0: "拖移坐标", 12.0: "点击坐标", 13.0: "点击坐标",
+    14.0: "点击坐标", 15.0: "点击坐标", 16.0: "悬停坐标",
+    4.0: "文本内容", 5.0: "等待秒数", 6.0: "滚动距离",
+    7.0: "组合键", 9.0: "保存路径",
+}
+
+_TYPE_PLACEHOLDER = {
+    1.0: "图片路径", 2.0: "图片路径", 3.0: "图片路径",
+    8.0: "图片路径", 10.0: "图片路径",
+    11.0: "起点x,起点y -> 中点x,中点y -> 终点x,终点y",
+    12.0: "x,y  (如 500,300)", 13.0: "x,y",
+    14.0: "x,y", 15.0: "x,y", 16.0: "x,y",
+    4.0: "请输入要发送的文本", 5.0: "等待秒数 (如 1.5)",
+    6.0: "滚动距离 (正数向上，负数向下)", 7.0: "组合键 (如 ctrl+s)",
+    9.0: "保存目录 (如 D:\\Screenshots)",
+}
 
 class WorkerThread(QThread):
     log_signal = Signal(str)
@@ -610,152 +693,196 @@ class TaskRow(QFrame):
         self.setFrameShape(QFrame.StyledPanel)
         self.layout = QHBoxLayout(self)
         self.layout.setContentsMargins(5, 5, 5, 5)
-        
+
         # 操作类型选择
         self.type_combo = QComboBox()
-        self.type_combo.addItems(list(CMD_TYPES.keys()))
+        items = list(CMD_TYPES.keys())
+        self.type_combo.addItems(items)
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
         self.layout.addWidget(self.type_combo)
-        
+
+        # 参数标签
+        self.param_label = QLabel("图片路径")
+        self.param_label.setStyleSheet("color: #666; font-size: 12px;")
+        self.param_label.setFixedWidth(55)
+        self.layout.addWidget(self.param_label)
+
         # 参数输入区域
         self.value_input = QLineEdit()
-        self.value_input.setPlaceholderText("参数值 (如图片路径、文本、时间)")
         self.layout.addWidget(self.value_input)
-        
-        # 文件选择按钮 (默认隐藏)
+
+        # 文件选择按钮
         self.file_btn = QPushButton("选择图片")
         self.file_btn.clicked.connect(self.select_file)
-        self.file_btn.setVisible(True) # 默认是左键单击，需要显示
         self.layout.addWidget(self.file_btn)
-        
-        # 重试次数 (默认隐藏)
-        self.retry_input = QLineEdit()
-        self.retry_input.setPlaceholderText("重试次数 (1=一次, -1=无限)")
-        self.retry_input.setText("1")
-        self.retry_input.setFixedWidth(100)
-        self.retry_input.setVisible(True)
+
+        # 重试次数 + 说明
+        self.retry_label = QLabel("重试:")
+        self.retry_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.retry_label.setFixedWidth(30)
+        self.layout.addWidget(self.retry_label)
+        self.retry_input = QLineEdit("1")
+        self.retry_input.setFixedWidth(35)
         self.layout.addWidget(self.retry_input)
-        
+        self.retry_hint = QLabel("1=一次, -1=无限")
+        self.retry_hint.setStyleSheet("color: #aaa; font-size: 10px;")
+        self.layout.addWidget(self.retry_hint)
+
         # 删除按钮
         self.del_btn = QPushButton("X")
         self.del_btn.setStyleSheet("color: red; font-weight: bold;")
         self.del_btn.setFixedWidth(30)
         self.del_btn.clicked.connect(lambda: delete_callback(self))
         self.layout.addWidget(self.del_btn)
-        
+
         parent_layout.addWidget(self)
+        # 初始化为第一个类型
+        self.on_type_changed(items[0])
 
     def on_type_changed(self, text):
         cmd_type = CMD_TYPES[text]
-        
-        # 图片相关操作 (1, 2, 3, 8, 10)
-        if cmd_type in [1.0, 2.0, 3.0, 8.0, 10.0]:
-            self.file_btn.setVisible(True)
+
+        # 参数标签 & placeholder
+        self.param_label.setText(
+            _TYPE_PARAM_LABEL.get(cmd_type, "参数"))
+        self.value_input.setPlaceholderText(
+            _TYPE_PLACEHOLDER.get(cmd_type, ""))
+
+        # 图片类：显示选择按钮 + 重试
+        is_image = cmd_type in _IMG_TYPES
+        is_screenshot = cmd_type == 9.0
+        show_file_btn = is_image or is_screenshot
+        show_retry = is_image
+
+        self.file_btn.setVisible(show_file_btn)
+        if is_screenshot:
+            self.file_btn.setText("选择文件夹")
+        else:
             self.file_btn.setText("选择图片")
-            self.retry_input.setVisible(True)
-            self.value_input.setPlaceholderText("图片路径或坐标 (如 500,300)")
-        # 输入 (4)
-        elif cmd_type == 4.0:
-            self.file_btn.setVisible(False)
-            self.retry_input.setVisible(False)
-            self.value_input.setPlaceholderText("请输入要发送的文本")
-        # 等待 (5)
-        elif cmd_type == 5.0:
-            self.file_btn.setVisible(False)
-            self.retry_input.setVisible(False)
-            self.value_input.setPlaceholderText("等待秒数 (如 1.5)")
-        # 滚轮 (6)
-        elif cmd_type == 6.0:
-            self.file_btn.setVisible(False)
-            self.retry_input.setVisible(False)
-            self.value_input.setPlaceholderText("滚动距离 (正数向上，负数向下)")
-        # 系统按键 (7)
-        elif cmd_type == 7.0:
-            self.file_btn.setVisible(False)
-            self.retry_input.setVisible(False)
-            self.value_input.setPlaceholderText("组合键 (如 ctrl+s, alt+tab)")
-        # 左键拖移 (11) — 仅坐标
-        elif cmd_type == 11.0:
-            self.file_btn.setVisible(False)
-            self.retry_input.setVisible(False)
-            self.value_input.setPlaceholderText("拖移坐标 (如 100,200 -> 300,400)")
-        # 截图保存 (9)
-        elif cmd_type == 9.0:
-            self.file_btn.setVisible(True)
-            self.file_btn.setText("选择保存文件夹")
-            self.retry_input.setVisible(False)
-            self.value_input.setPlaceholderText("保存目录 (如 D:\\Screenshots)")
+
+        self.retry_label.setVisible(show_retry)
+        self.retry_input.setVisible(show_retry)
+        self.retry_hint.setVisible(show_retry)
 
     def set_data(self, data):
-        """用于回填数据"""
         cmd_type = data.get("type")
         value = data.get("value", "")
         retry = data.get("retry", 1)
-
-        # 设置类型 (反向查找文本)
         if cmd_type in CMD_TYPES_REV:
             self.type_combo.setCurrentText(CMD_TYPES_REV[cmd_type])
-        
-        # 设置值
         self.value_input.setText(str(value))
-        
-        # 设置重试次数
         self.retry_input.setText(str(retry))
 
     def select_file(self):
         cmd_type = CMD_TYPES[self.type_combo.currentText()]
-        
-        # 截图保存 (9.0) -> 选择文件夹
         if cmd_type == 9.0:
-            folder = QFileDialog.getExistingDirectory(self, "选择保存文件夹", os.getcwd())
+            folder = QFileDialog.getExistingDirectory(
+                self, "选择保存文件夹", os.getcwd())
             if folder:
                 self.value_input.setText(folder)
-        
-        # 其他图片操作 (1, 2, 3, 8) -> 打开文件对话框
         else:
-            filename, _ = QFileDialog.getOpenFileName(self, "选择图片", os.getcwd(), "Image Files (*.png *.jpg *.bmp)")
+            filename, _ = QFileDialog.getOpenFileName(
+                self, "选择图片", os.getcwd(),
+                "Image Files (*.png *.jpg *.bmp)")
             if filename:
                 self.value_input.setText(filename)
 
     def get_data(self):
         cmd_type = CMD_TYPES[self.type_combo.currentText()]
         value = self.value_input.text()
-        
-        # 数据校验与转换
         try:
-            if cmd_type in [5.0, 6.0]:
-                # 尝试转换为数字，如果失败可能会在运行时报错，这里简单处理
-                if not value: value = "0"
-            
+            if cmd_type in (5.0, 6.0):
+                if not value:
+                    value = "0"
             retry = 1
             if self.retry_input.isVisible():
                 retry_text = self.retry_input.text()
                 if retry_text:
                     retry = int(retry_text)
         except ValueError:
-            pass # 保持默认
+            pass
+        return {"type": cmd_type, "value": value, "retry": retry}
 
-        return {
-            "type": cmd_type,
-            "value": value,
-            "retry": retry
-        }
+class SettingsDialog(QDialog):
+    """Cmd+, 设置窗口。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.setFixedSize(300, 150)
+        layout = QVBoxLayout(self)
+
+        log_btn = QPushButton("查看日志")
+        log_btn.clicked.connect(self._open_log_viewer)
+        layout.addWidget(log_btn)
+
+        layout.addStretch()
+
+    def _open_log_viewer(self):
+        viewer = LogViewer(self)
+        viewer.exec()
+
+
+class LogViewer(QDialog):
+    """日志查看窗口。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("运行日志")
+        self.resize(700, 500)
+        layout = QVBoxLayout(self)
+
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setStyleSheet("font-family: Menlo, monospace; font-size: 12px;")
+        layout.addWidget(self.text)
+
+        btn_layout = QHBoxLayout()
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.clicked.connect(self._load_log)
+        btn_layout.addWidget(refresh_btn)
+
+        clear_btn = QPushButton("清空日志文件")
+        clear_btn.clicked.connect(self._clear_log)
+        btn_layout.addWidget(clear_btn)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        self._load_log()
+
+    def _load_log(self):
+        try:
+            if os.path.exists(_log_file):
+                with open(_log_file, 'r', encoding='utf-8') as f:
+                    self.text.setPlainText(f.read())
+            else:
+                self.text.setPlainText("（暂无日志）")
+        except Exception as e:
+            self.text.setPlainText(f"读取失败: {e}")
+
+    def _clear_log(self):
+        try:
+            open(_log_file, 'w').close()
+            self.text.setPlainText("（已清空）")
+        except Exception as e:
+            self.text.setPlainText(f"清空失败: {e}")
+
 
 class RPAWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("不高兴就喝水 RPA 配置工具")
         self.resize(800, 600)
-        
+
         self.engine = RPAEngine()
         self.worker = None
         self.rows = []
 
         # 全局热键
         self._rec_action_map = {
-            "click": (1.0, "左键单击"), "dblclick": (2.0, "左键双击"),
-            "right": (3.0, "右键单击"), "middle": (10.0, "中键单击"),
-            "hover": (8.0, "鼠标悬停"), "drag": (11.0, "左键拖移"),
+            "click": (12.0, "坐标左键单击"), "dblclick": (13.0, "坐标左键双击"),
+            "right": (14.0, "坐标右键单击"), "middle": (15.0, "坐标中键单击"),
+            "hover": (16.0, "坐标鼠标悬停"), "drag": (11.0, "坐标左键拖移"),
         }
         self.hotkey_thread = HotkeyThread()
         self.hotkey_thread.start_signal.connect(self.start_task)
@@ -771,7 +898,7 @@ class RPAWindow(QMainWindow):
 
         # 顶部控制栏
         top_bar = QHBoxLayout()
-        
+
         self.add_btn = QPushButton("+ 新增指令")
         self.add_btn.clicked.connect(self.add_row)
         top_bar.addWidget(self.add_btn)
@@ -789,16 +916,16 @@ class RPAWindow(QMainWindow):
         top_bar.addWidget(self.clear_btn)
 
         top_bar.addStretch()
-        
+
         self.loop_check = QComboBox()
         self.loop_check.addItems(["执行一次", "循环执行"])
         top_bar.addWidget(self.loop_check)
-        
+
         self.start_btn = QPushButton("开始运行")
         self.start_btn.setStyleSheet("background-color: #4CAF50; color: white;")
         self.start_btn.clicked.connect(self.start_task)
         top_bar.addWidget(self.start_btn)
-        
+
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setStyleSheet("background-color: #f44336; color: white;")
         self.stop_btn.clicked.connect(self.stop_task)
@@ -817,22 +944,31 @@ class RPAWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         self.task_container = QWidget()
         self.task_layout = QVBoxLayout(self.task_container)
-        self.task_layout.addStretch() # 弹簧，确保添加的行在顶部
+        self.task_layout.addStretch()
         scroll.setWidget(self.task_container)
         main_layout.addWidget(scroll)
 
-        # 日志区域
+        # 日志区域（默认隐藏）
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
         self.log_area.setMaximumHeight(150)
-        main_layout.addWidget(QLabel("运行日志:"))
+        self.log_area.setVisible(False)
+        self.log_label = QLabel("运行日志:")
+        self.log_label.setVisible(False)
+        main_layout.addWidget(self.log_label)
         main_layout.addWidget(self.log_area)
+
+        # Cmd+, 设置快捷键
+        from PySide6.QtGui import QAction, QKeySequence
+        pref_action = QAction("设置...", self)
+        pref_action.setShortcut(QKeySequence.Preferences)
+        pref_action.triggered.connect(self._open_settings)
+        self.addAction(pref_action)
 
         # 初始添加一行
         self.add_row()
 
     def _on_record(self, action, x, y, x2, y2, x3, y3):
-        """录制回调：插入步骤。drag 有 3 个坐标点，其余 1 个。"""
         if action not in self._rec_action_map:
             return
         cmd_type, label = self._rec_action_map[action]
@@ -841,11 +977,10 @@ class RPAWindow(QMainWindow):
         else:
             value = f"{x},{y}"
         self.add_row({"type": cmd_type, "value": value, "retry": 1})
-        print(f"[录制] {label} → {value}")
+        _logger.info(f"录制 {label} → {value}")
 
     def _on_recording_toggled(self, entering):
         if entering:
-            # 清除初始空行，避免回放时报"有空参数"
             empty = [r for r in self.rows
                      if not r.get_data().get("value", "").strip()]
             for r in empty:
@@ -862,16 +997,16 @@ class RPAWindow(QMainWindow):
             self.show()
             self.activateWindow()
 
+    def _open_settings(self):
+        dlg = SettingsDialog(self)
+        dlg.exec()
+
     def add_row(self, data=None):
-        # 移除底部的弹簧
         self.task_layout.takeAt(self.task_layout.count() - 1)
-        
         row = TaskRow(self.task_layout, self.delete_row)
         if data:
             row.set_data(data)
         self.rows.append(row)
-        
-        # 加回弹簧
         self.task_layout.addStretch()
 
     def delete_row(self, row_widget):
@@ -884,7 +1019,7 @@ class RPAWindow(QMainWindow):
             row.deleteLater()
         self.rows.clear()
         self.add_row()
-            
+
     def save_config(self):
         tasks = []
         for row in self.rows:
@@ -907,23 +1042,20 @@ class RPAWindow(QMainWindow):
             return
         name = "".join(c for c in name.strip() if c not in r'\/:*?"<>|')
 
-        # 迁移图片到 profiles/images/（坐标格式跳过）
         for task in tasks:
             cmd_type = task.get("type")
             value = task.get("value", "")
-            if cmd_type not in _IMAGE_TYPES or not value or _is_coordinate(value):
+            if cmd_type not in _IMG_TYPES or not value:
                 continue
             src = os.path.abspath(value)
             if not os.path.isfile(src):
                 continue
-            # 已在 images/ 目录内 → 跳过
             if os.path.commonpath([src, os.path.abspath(images_dir)]) == os.path.abspath(images_dir):
                 task["value"] = os.path.join("images", os.path.basename(src))
                 continue
 
             basename = os.path.basename(src)
             dest = os.path.join(images_dir, basename)
-            # 重名处理
             if os.path.exists(dest) and not os.path.samefile(src, dest):
                 stem, ext = os.path.splitext(basename)
                 i = 2
@@ -955,7 +1087,6 @@ class RPAWindow(QMainWindow):
             if not isinstance(tasks, list):
                 raise ValueError("文件格式不正确")
 
-            # 相对路径 → 绝对路径（坐标格式跳过，从 profiles/ 目录解析）
             config_dir = os.path.dirname(os.path.abspath(filename))
             for task in tasks:
                 value = task.get("value", "")
@@ -963,12 +1094,10 @@ class RPAWindow(QMainWindow):
                     task["value"] = os.path.normpath(
                         os.path.join(config_dir, value))
 
-            # 清空现有行
             for row in self.rows:
                 row.deleteLater()
             self.rows.clear()
 
-            # 重新添加行
             for task in tasks:
                 self.add_row(task)
 
@@ -983,26 +1112,25 @@ class RPAWindow(QMainWindow):
                 QMessageBox.warning(self, "警告", "请检查有空参数的指令！")
                 return
             tasks.append(data)
-            
+
         if not tasks:
             QMessageBox.warning(self, "警告", "请至少添加一条指令！")
             return
 
         self.log_area.clear()
         self.log("任务开始...")
-        
+
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.add_btn.setEnabled(False)
-        
+
         loop = (self.loop_check.currentText() == "循环执行")
-        
+
         self.worker = WorkerThread(self.engine, tasks, loop)
         self.worker.log_signal.connect(self.log)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.start()
 
-        # 最小化窗口
         self.showMinimized()
 
     def stop_task(self):
@@ -1014,8 +1142,6 @@ class RPAWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.add_btn.setEnabled(True)
         self.log("任务已结束")
-        
-        # 恢复窗口并置顶
         self.showNormal()
         self.activateWindow()
 
@@ -1023,12 +1149,10 @@ class RPAWindow(QMainWindow):
         self.log_area.append(msg)
 
     def closeEvent(self, event):
-        """窗口关闭事件：确保线程停止，防止残留"""
         if self.worker and self.worker.isRunning():
             self.engine.stop()
             self.worker.quit()
             self.worker.wait()
-        # 停止全局热键监听
         self.hotkey_thread.stop_listener()
         self.hotkey_thread.quit()
         self.hotkey_thread.wait()
@@ -1039,6 +1163,7 @@ def main():
     window = RPAWindow()
     window.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()

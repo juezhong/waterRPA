@@ -1,3 +1,4 @@
 profiles/
 __pycache__/
 .venv/
+logs/
