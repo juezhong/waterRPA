@@ -100,20 +100,28 @@ def _match_on_haystack(haystack_gray, needle_full, needle_half, confidence):
     if nhh <= hh and nhw <= hw and min(nfh, nfw) > 20:
         hay_half = cv2.resize(haystack_gray, None, fx=0.5, fy=0.5)
         result = cv2.matchTemplate(hay_half, needle_half, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
         if max_val >= confidence:
             cx = (max_loc[0] + nhw // 2) * 2
             cy = (max_loc[1] + nhh // 2) * 2
-            return (cx, cy, f"s=0.5 c={max_val:.2f}")
+            return (cx, cy, f"s=0.5 c=+{max_val:.2f}")
+        if min_val <= -confidence:
+            cx = (min_loc[0] + nhw // 2) * 2
+            cy = (min_loc[1] + nhh // 2) * 2
+            return (cx, cy, f"s=0.5 c={min_val:.2f}(inv)")
 
     # --- 1.0x 回退 ---
     if nfh <= hh and nfw <= hw:
         result = cv2.matchTemplate(haystack_gray, needle_full, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
         if max_val >= confidence:
             cx = max_loc[0] + nfw // 2
             cy = max_loc[1] + nfh // 2
-            return (cx, cy, f"s=1.0 c={max_val:.2f}")
+            return (cx, cy, f"s=1.0 c=+{max_val:.2f}")
+        if min_val <= -confidence:
+            cx = min_loc[0] + nfw // 2
+            cy = min_loc[1] + nfh // 2
+            return (cx, cy, f"s=1.0 c={min_val:.2f}(inv)")
 
     return None
 
